@@ -41,6 +41,23 @@ writable, else X11 (`$DISPLAY`), else a no-op stub.
 Design choice: unhandled commands are ACK'd as safe no-ops so the unmodified app
 stays healthy instead of relaunch-looping the helper. See `src/main.rs` dispatch.
 
+## Transcript hook (voice commands)
+
+Set `WISPR_TRANSCRIPT_HOOK` to an executable (a path, or a name on `PATH`)
+in the app's environment and every `PasteText` runs it first, with the
+transcript as its only argument:
+
+```bash
+export WISPR_TRANSCRIPT_HOOK=my-voice-commands   # in your session environment
+```
+
+- Exit 0: the hook handled it (ran a command), so nothing is pasted.
+- Anything else, a failure to start, or taking longer than 2 s: pasted as usual.
+
+The hook runs with stdin and stdout on `/dev/null` and without the IPC pipe;
+its stderr goes to the helper log. Start long-lived work detached
+(`setsid -f`) and exit, since the helper waits for the answer.
+
 ## Build
 
 Needs a Rust toolchain (not currently installed on this machine):

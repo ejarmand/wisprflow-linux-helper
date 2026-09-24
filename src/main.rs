@@ -13,6 +13,7 @@
 
 mod backend;
 mod capture;
+mod hook;
 mod keymap;
 mod proto;
 
@@ -161,6 +162,12 @@ fn handle_request(
         "PasteText" => {
             let text = payload.get("text").and_then(Value::as_str).unwrap_or("");
             let html = payload.get("htmlText").and_then(Value::as_str).filter(|s| !s.is_empty());
+            // A transcript the user's hook ran as a command is not pasted; the
+            // ACK tells the app it was delivered.
+            if hook::handled(text) {
+                ipc.send(&proto::ack(uuid));
+                return;
+            }
             match be.paste_text(text, html) {
                 Ok(()) => ipc.send(&proto::ack(uuid)),
                 Err(e) => {
