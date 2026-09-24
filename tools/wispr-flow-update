@@ -1,0 +1,237 @@
+#!/usr/bin/env bash
+#
+# wispr-flow-update -- install the latest wispr-flow-linux AppImage release
+# with the helper built from this checkout swapped in.
+#
+# Usage:
+#   wispr-flow-update             build the helper; install the latest release
+#                                 if it is new; put the helper into it
+#   wispr-flow-update --status    show installed and latest versions
+#   wispr-flow-update --rollback  switch back to the previous version
+#
+# Layout (PREFIX defaults to ~/.local, override with WISPR_FLOW_PREFIX):
+#   PREFIX/opt/wispr-flow/<release tag>/   extracted AppImage
+#   PREFIX/opt/wispr-flow/current          symlink to the active version
+#   PREFIX/opt/wispr-flow/previous         symlink to the one before it
+#   PREFIX/bin/wispr-flow                  launcher: runs current/AppRun
+#   PREFIX/share/applications/wispr-flow.desktop
+#
+# Re-run it after changing the helper: with no new release it only reinstalls
+# the helper. Restart Wispr Flow afterwards for either change to take effect.
+
+readonly REPO='wispr-flow-linux/wispr-flow-linux'
+readonly API="https://api.github.com/repos/$REPO/releases/latest"
+readonly HELPER_NAME='wispr-flow-linux-helper'
+# Extra Electron flags for every launch. Renderer accessibility exposes the
+# Hub's buttons over AT-SPI, which hyprkarl-wispr-add-word presses.
+readonly LAUNCH_ARGS='--force-renderer-accessibility'
+
+prefix=${WISPR_FLOW_PREFIX:-$HOME/.local}
+opt_dir="$prefix/opt/wispr-flow"
+cache_dir="${XDG_CACHE_HOME:-$HOME/.cache}/wispr-flow-update"
+src_dir=$(cd "$(dirname "$(readlink -f "$0")")/.." && pwd)
+
+say() {
+	printf '%s\n' "$*"
+}
+
+die() {
+	printf 'wispr-flow-update: %s\n' "$*" >&2
+	exit 1
+}
+
+# Point symlink $2 at $1 atomically (rename over the old link).
+relink() {
+	local target=$1 link=$2
+	ln -sfn "$target" "$link.new" && mv -T "$link.new" "$link"
+}
+
+# Print the path of the helper inside an extracted release.
+bundled_helper() {
+	local found
+	found=$(find "$1/usr/lib" -path "*/resources/Release/$HELPER_NAME" \
+		-type f 2>/dev/null | head -n1)
+	[[ -n $found ]] || return 1
+	printf '%s\n' "$found"
+}
+
+# Sets helper_bin to the freshly built binary.
+build_helper() {
+	say "Building the helper in $src_dir"
+	cargo build --release --quiet --manifest-path "$src_dir/Cargo.toml" ||
+		die 'helper build failed; nothing was changed'
+	helper_bin="$src_dir/target/release/$HELPER_NAME"
+	"$helper_bin" --version >/dev/null ||
+		die "built helper does not run: $helper_bin"
+}
+
+# Sets tag, asset_name, asset_url, asset_sha256 from the latest release.
+fetch_release() {
+	local json arch
+	arch=$(uname -m)
+	json=$(curl -fsSL "$API") || die "cannot reach $API"
+	tag=$(jq -r '.tag_name' <<<"$json")
+	read -r asset_name asset_url asset_sha256 < <(jq -r --arg a "$arch" '
+		.assets[] | select(.name | endswith("-" + $a + ".AppImage"))
+		| [.name, .browser_download_url, (.digest // "" | sub("^sha256:"; ""))]
+		| @tsv' <<<"$json")
+	[[ -n $tag && -n $asset_url ]] ||
+		die "no $arch AppImage in release ${tag:-?}"
+	[[ -n $asset_sha256 ]] || die "release $tag publishes no sha256 digest"
+}
+
+# Download the AppImage into the cache (reused if it already verifies).
+download() {
+	local file="$cache_dir/$asset_name"
+	mkdir -p "$cache_dir" || die "cannot create $cache_dir"
+	if ! sha256sum --status -c <<<"$asset_sha256  $file" 2>/dev/null; then
+		say "Downloading $asset_name"
+		curl -fL --retry 3 --progress-bar -o "$file.part" "$asset_url" ||
+			die "download failed: $asset_url"
+		mv "$file.part" "$file"
+		sha256sum --status -c <<<"$asset_sha256  $file" ||
+			die "sha256 mismatch for $asset_name; not installing it"
+	fi
+	# Keep only the newest download.
+	find "$cache_dir" -maxdepth 1 -type f ! -name "$asset_name" -delete
+	appimage=$file
+}
+
+extract() {
+	local dest="$opt_dir/$tag" work
+	work=$(mktemp -d "$opt_dir/.extract.XXXXXX") || die 'mktemp failed'
+	chmod +x "$appimage"
+	say "Extracting into $dest"
+	if ! (cd "$work" && "$appimage" --appimage-extract >/dev/null); then
+		rm -rf "$work"
+		die "extracting $appimage failed"
+	fi
+	mv -T "$work/squashfs-root" "$dest" || die "cannot create $dest"
+	rm -rf "$work"
+}
+
+# Swap our helper into release dir $1, keeping the shipped one as .orig.
+install_helper() {
+	local dir=$1 target shipped ours
+	target=$(bundled_helper "$dir") || die "no $HELPER_NAME inside $dir"
+	[[ -e $target.orig ]] || cp -p "$target" "$target.orig"
+	install -m 0755 "$helper_bin" "$target" || die "cannot write $target"
+	shipped=$("$target.orig" --version 2>/dev/null)
+	ours=$("$helper_bin" --version)
+	say "Helper: $ours (release shipped ${shipped:-unknown})"
+	if [[ $shipped != "$ours" ]]; then
+		say "WARNING: the release ships a different helper version."
+		say "  Rebase your helper branch onto the upstream tag it ships"
+		say "  so the app and helper agree, then run this again."
+	fi
+}
+
+# Launcher wrapper plus a desktop entry copied from the release, pointed at it.
+# The wrapper appends LAUNCH_ARGS after the caller's arguments, so AppRun still
+# sees --doctor / --install-udev-rules first.
+install_launcher() {
+	local apps="$prefix/share/applications" desktop icon
+	local launcher="$prefix/bin/wispr-flow"
+	mkdir -p "$prefix/bin" "$apps"
+	printf '#!/bin/sh\nexec "%s" "$@" %s\n' \
+		"$opt_dir/current/AppRun" "$LAUNCH_ARGS" >"$launcher.new" &&
+		chmod 0755 "$launcher.new" && mv -T "$launcher.new" "$launcher" ||
+		die "cannot write $launcher"
+
+	desktop=$(find "$opt_dir/current/" -maxdepth 1 -name '*.desktop' | head -n1)
+	[[ -n $desktop ]] || return 0
+	icon=$(sed -n 's/^Icon=//p' "$desktop" | head -n1)
+	icon="$opt_dir/current/$icon.png"
+	sed -e "s|^Exec=.*|Exec=$prefix/bin/wispr-flow %U|" \
+		-e '/^X-AppImage-/d' \
+		"$desktop" >"$apps/wispr-flow.desktop"
+	if [[ -f $icon ]]; then
+		sed -i "s|^Icon=.*|Icon=$icon|" "$apps/wispr-flow.desktop"
+	fi
+}
+
+# Keep only the current and previous versions.
+prune() {
+	local keep_cur keep_prev dir
+	keep_cur=$(readlink -f "$opt_dir/current")
+	keep_prev=$(readlink -f "$opt_dir/previous" 2>/dev/null)
+	for dir in "$opt_dir"/*/; do
+		dir=${dir%/}
+		[[ -L $dir ]] && continue
+		[[ $dir == "$keep_cur" || $dir == "$keep_prev" ]] && continue
+		say "Removing old version $(basename "$dir")"
+		rm -rf "$dir"
+	done
+}
+
+restart_note() {
+	if pgrep -f "$opt_dir/" >/dev/null; then
+		say 'Wispr Flow is running: quit and reopen it to use this version.'
+	fi
+}
+
+cmd_update() {
+	local old
+	build_helper
+	fetch_release
+	mkdir -p "$opt_dir" || die "cannot create $opt_dir"
+	if [[ -d $opt_dir/$tag ]]; then
+		say "Release $tag is already installed"
+	else
+		download
+		extract
+	fi
+	install_helper "$opt_dir/$tag"
+
+	old=$(readlink "$opt_dir/current" 2>/dev/null)
+	if [[ -n $old && $old != "$opt_dir/$tag" ]]; then
+		relink "$old" "$opt_dir/previous"
+	fi
+	relink "$opt_dir/$tag" "$opt_dir/current"
+	install_launcher
+	prune
+	say "Installed $tag -> $prefix/bin/wispr-flow"
+	restart_note
+}
+
+cmd_status() {
+	local cur prev
+	cur=$(readlink "$opt_dir/current" 2>/dev/null)
+	prev=$(readlink "$opt_dir/previous" 2>/dev/null)
+	say "current:  $(basename "${cur:-(none)}")"
+	say "previous: $(basename "${prev:-(none)}")"
+	if [[ -n $cur ]]; then
+		say "helper:   $("$(bundled_helper "$cur")" --version 2>&1)"
+	fi
+	fetch_release
+	say "latest:   $tag"
+}
+
+cmd_rollback() {
+	local cur prev
+	cur=$(readlink "$opt_dir/current" 2>/dev/null)
+	prev=$(readlink "$opt_dir/previous" 2>/dev/null)
+	[[ -n $cur && -n $prev && -d $prev ]] ||
+		die 'no previous version to roll back to'
+	relink "$prev" "$opt_dir/current"
+	relink "$cur" "$opt_dir/previous"
+	install_launcher
+	say "Rolled back to $(basename "$prev")"
+	restart_note
+}
+
+main() {
+	local tool
+	for tool in cargo curl jq sha256sum; do
+		command -v "$tool" >/dev/null || die "missing required tool: $tool"
+	done
+	case ${1:-} in
+		'') cmd_update ;;
+		--status) cmd_status ;;
+		--rollback) cmd_rollback ;;
+		-h | --help) sed -n '3,21p' "$0" | sed 's/^# \{0,1\}//' ;;
+		*) die "unknown option: $1 (try --help)" ;;
+	esac
+}
+
+main "$@"
