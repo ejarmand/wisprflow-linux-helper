@@ -142,7 +142,7 @@ impl UInput {
     }
 
     /// Press a chord: hold `mods` (in order), tap `key`, release everything in
-    /// reverse.
+    /// reverse, then release every modifier on this device (see [`chord_steps`]).
     ///
     /// CRITICAL: the modifier-down → key-down → key-up → modifier-up events are
     /// emitted as one *contiguous* batch with **no inter-event sleep**. On
@@ -153,84 +153,40 @@ impl UInput {
     /// bug, not the fix — verified: 0 ms → modifier applied, ≥8 ms → dropped.
     /// See docs/learnings/wayland-injection.md.
     ///
-    /// Mirrors the Windows helper's GetKeyState dance: any modifier the user is
-    /// *physically* holding at injection time is released first and restored
-    /// afterwards, so e.g. a held Ctrl doesn't turn our injected `v` into a
-    /// stray Ctrl+V (or our injected Ctrl+V into Ctrl+Shift+V). When
-    /// `/dev/input` isn't readable (no `input` group / uaccess ACL), the held
-    /// set is empty and this degrades to a plain chord — see [`held_modifiers`].
+    /// After a failed press only the remaining releases are sent, so an error
+    /// mid-chord cannot leave a modifier down.
     pub fn chord(&mut self, key: u16, mods: &[u16]) -> Result<()> {
-        let held = held_modifiers();
-        for &m in &held {
-            let _ = self.key(m, false);
+        let mut result = Ok(());
+        for (code, press) in chord_steps(key, mods) {
+            if press && result.is_err() {
+                continue;
+            }
+            if let Err(e) = self.key(code, press) {
+                result = result.and(Err(e));
+            }
         }
-        for &m in mods {
-            self.key(m, true)?;
-        }
-        self.key(key, true)?;
-        self.key(key, false)?;
-        for &m in mods.iter().rev() {
-            self.key(m, false)?;
-        }
-        // Restore physically-held modifiers (reverse order). Best-effort.
-        for &m in held.iter().rev() {
-            let _ = self.key(m, true);
-        }
-        Ok(())
+        result
     }
 }
 
-/// Snapshot the modifier keys the user is *physically* holding right now, by
-/// querying every readable `/dev/input/event*` device with `EVIOCGKEY` (a
-/// bitmap of currently-pressed keycodes) and intersecting with the modifier set.
+/// The key events for [`UInput::chord`], in order.
 ///
-/// Returns an empty list — and is therefore a no-op for `chord` — when no event
-/// device is readable. Reading `/dev/input` typically needs the `input` group
-/// or the logind `uaccess` ACL; on sessions without it, the snapshot is simply
-/// skipped (the common case at paste time has no modifier held anyway).
-pub fn held_modifiers() -> Vec<u16> {
-    use std::collections::BTreeSet;
-    // EVIOCGKEY(len) = _IOC(_IOC_READ=2, 'E'=0x45, 0x18, len). KEY_MAX=0x2ff ->
-    // a 96-byte bitmap covers every keycode we care about.
-    const BITMAP_LEN: usize = (KEY_MAX as usize / 8) + 1;
-    let req: libc::c_ulong =
-        ((2u64 << 30) | ((BITMAP_LEN as u64) << 16) | (0x45 << 8) | 0x18) as libc::c_ulong;
-
-    let dir = match std::fs::read_dir("/dev/input") {
-        Ok(d) => d,
-        Err(_) => return Vec::new(),
-    };
-    let mut held = BTreeSet::new();
-    for entry in dir.flatten() {
-        let path = entry.path();
-        let is_event = path
-            .file_name()
-            .and_then(|s| s.to_str())
-            .is_some_and(|n| n.starts_with("event"));
-        if !is_event {
-            continue;
-        }
-        let file = match OpenOptions::new()
-            .read(true)
-            .custom_flags(libc::O_NONBLOCK)
-            .open(&path)
-        {
-            Ok(f) => f,
-            Err(_) => continue, // not readable -> skip this device
-        };
-        let mut bitmap = [0u8; BITMAP_LEN];
-        let r = unsafe { libc::ioctl(file.as_raw_fd(), req, bitmap.as_mut_ptr()) };
-        if r < 0 {
-            continue;
-        }
-        for &m in keymap::EVDEV_MODIFIERS {
-            let (byte, bit) = (m as usize / 8, m as u32 % 8);
-            if byte < bitmap.len() && (bitmap[byte] >> bit) & 1 == 1 {
-                held.insert(m);
-            }
-        }
-    }
-    held.into_iter().collect()
+/// Nothing is pressed here that is not released in the same batch. Only this
+/// device can release a key it pressed, so pressing a modifier here to
+/// "restore" one the user is physically holding (the Windows helper's
+/// GetKeyState dance) leaves it down after they let go: Hyprland merges
+/// modifiers across keyboards for binds, so Super+W then fires Super+Ctrl+W
+/// until the helper restarts. Releasing the user's held modifiers here was
+/// never effective either: the kernel drops a key-up for a key this device
+/// does not hold. The trailing release of every modifier is a no-op normally
+/// and clears any modifier this device still holds.
+fn chord_steps(key: u16, mods: &[u16]) -> Vec<(u16, bool)> {
+    let mut steps: Vec<(u16, bool)> = mods.iter().map(|&m| (m, true)).collect();
+    steps.push((key, true));
+    steps.push((key, false));
+    steps.extend(mods.iter().rev().map(|&m| (m, false)));
+    steps.extend(keymap::EVDEV_MODIFIERS.iter().map(|&m| (m, false)));
+    steps
 }
 
 impl Drop for UInput {
@@ -247,4 +203,40 @@ fn ioctl_set(fd: libc::c_int, req: libc::c_ulong, arg: libc::c_int) -> Result<()
         ));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const CTRL: u16 = 29;
+    const V: u16 = 47;
+
+    #[test]
+    fn chord_taps_key_inside_its_modifiers() {
+        let steps = chord_steps(V, &[CTRL]);
+        assert_eq!(
+            &steps[..4],
+            &[(CTRL, true), (V, true), (V, false), (CTRL, false)]
+        );
+    }
+
+    #[test]
+    fn chord_ends_with_every_modifier_released() {
+        let steps = chord_steps(V, &[CTRL]);
+        for &m in keymap::EVDEV_MODIFIERS {
+            let last = steps.iter().rev().find(|&&(code, _)| code == m);
+            assert_eq!(last, Some(&(m, false)), "modifier {m} not left released");
+        }
+    }
+
+    #[test]
+    fn chord_presses_only_what_it_was_asked_to() {
+        let pressed: Vec<u16> = chord_steps(V, &[CTRL])
+            .into_iter()
+            .filter(|&(_, press)| press)
+            .map(|(code, _)| code)
+            .collect();
+        assert_eq!(pressed, vec![CTRL, V]);
+    }
 }
