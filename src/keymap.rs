@@ -395,8 +395,8 @@ pub fn flag_to_evdev(flag: &str) -> Option<u16> {
     })
 }
 
-/// Linux evdev codes for the modifier keys we snapshot/release around injection
-/// (the held-modifier dance in `backend::uinput::held_modifiers`).
+/// Linux evdev codes for the modifier keys; `backend::uinput` releases all of
+/// them at the end of every chord.
 pub const EVDEV_MODIFIERS: &[u16] = &[
     29,  // KEY_LEFTCTRL
     97,  // KEY_RIGHTCTRL

@@ -27,7 +27,7 @@ Recovered directly from the shipped Electron bundle — not guessed.
 |---|---|---|
 | `IsReady` → `ACK` | ✅ handshake + keepalive | ✅ |
 | `PasteText` | ✅ clipboard (`xclip`/`xsel`) + XTEST Ctrl+V | ✅ **live-validated** — in-process text/plain+text/html clipboard + uinput Ctrl+V |
-| `SimulateKeyPress` | ✅ VK→keysym→keycode + XTEST | ✅ VK→evdev + uinput chord (held-modifier snapshot/release) |
+| `SimulateKeyPress` | ✅ VK→keysym→keycode + XTEST | ✅ VK→evdev + uinput chord (all modifiers released after) |
 | `GetActiveAppInfo` / `GetAppInfo` | ✅ `_NET_ACTIVE_WINDOW`→PID/`WM_CLASS` | ✅ **KDE** via KWin script bridge; ⬜ other compositors |
 | `GetRunningApps` | ✅ `_NET_CLIENT_LIST` | ⚠️ KDE: active app only (full list TBD); ⬜ other |
 | `SetFocusChangeDetectorState` → `AppInfoUpdate` | ⬜ (TODO: `PropertyNotify`) | ✅ **KDE** — focus events on fd 3, gated & deduped |
@@ -121,7 +121,7 @@ src/
     mod.rs           Backend trait + types + detect() (Wayland > X11 > stub)
     x11.rs           X11 implementation (XTEST + _NET_* + xclip/xsel)
     wayland.rs       Wayland implementation (uinput injection + clipboard + KWin)
-    uinput.rs        in-process /dev/uinput virtual keyboard + held-modifier snapshot
+    uinput.rs        in-process /dev/uinput virtual keyboard
     wl_clipboard.rs  in-process text/plain+text/html clipboard (ext_data_control)
     kwin.rs          KDE active-window bridge + focus-event source (zbus + KWin script)
     stub.rs          no-op fallback (keeps handshake alive on unsupported sessions)
@@ -136,8 +136,10 @@ clipboard_test.py    in-process clipboard offers text/plain + text/html
 1. ✅ **KDE active-app identity + focus events** — done (`backend/kwin.rs`): KWin
    script pushes `windowActivated` → zbus service → cache + `AppInfoUpdate` events
    on fd 3 (gated by `SetFocusChangeDetectorState`).
-2. ✅ **Held-modifier snapshot/restore** (Wayland) — done (`backend/uinput.rs`),
-   guarded on `/dev/input` read access. TODO: X11 `XQueryKeymap` equivalent.
+2. ~~Held-modifier snapshot/restore~~ (Wayland) — removed: restoring a held
+   modifier on the virtual keyboard left it stuck after the user let go (on
+   Hyprland every bind then gained Ctrl), and the release half never reached
+   the compositor. Chords now end with every modifier released.
 3. ✅ **text/plain + text/html clipboard** (Wayland) — done (`backend/wl_clipboard.rs`,
    `ext_data_control`). TODO: X11 in-process selection owner; prior-clipboard
    save/restore (read side still uses `wl-paste`).
