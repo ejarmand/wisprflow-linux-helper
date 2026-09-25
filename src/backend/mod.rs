@@ -9,6 +9,7 @@
 pub mod atspi_app;
 pub mod atspi_sel;
 pub mod gnome;
+pub mod hyprland;
 pub mod kwin;
 pub mod stub;
 pub mod uinput;
@@ -100,7 +101,8 @@ pub fn active_app_payload(a: &ActiveApp) -> serde_json::Value {
 ///
 /// Layered "never blank" design:
 ///   * Tier-2 premium, per-compositor: `kwin::KwinTracker` (KDE),
-///     `gnome::GnomeTracker` (GNOME Shell extension) — richest, most reliable
+///     `gnome::GnomeTracker` (GNOME Shell extension), `hyprland::HyprlandTracker`
+///     (Hyprland IPC socket) — richest, most reliable
 ///     identity (true app-id, full window list, robust focus).
 ///   * Tier-1 universal baseline: `atspi_app::AtspiTracker` — desktop-agnostic
 ///     over the accessibility bus; the fallback that covers wlroots
@@ -144,6 +146,21 @@ impl ActiveAppProvider for gnome::GnomeTracker {
     }
     fn name(&self) -> &'static str {
         "gnome-shell-extension"
+    }
+}
+
+impl ActiveAppProvider for hyprland::HyprlandTracker {
+    fn current(&self) -> Option<ActiveApp> {
+        self.current()
+    }
+    fn get_running_apps(&self) -> Vec<RunningApp> {
+        self.get_running_apps()
+    }
+    fn set_focus_detection(&self, active: bool) {
+        self.set_focus_detection(active)
+    }
+    fn name(&self) -> &'static str {
+        "hyprland"
     }
 }
 
@@ -300,6 +317,15 @@ fn pick_injector() -> Box<dyn Backend> {
 fn pick_active_app_provider(events: EventSink) -> Option<Box<dyn ActiveAppProvider>> {
     if env_set("WAYLAND_DISPLAY") {
         // Tier-2 compositor bridge first (richest), AT-SPI as the universal fallback.
+        if env_set("HYPRLAND_INSTANCE_SIGNATURE") {
+            match hyprland::HyprlandTracker::start() {
+                Ok(t) => {
+                    log::info!("active-app: Hyprland IPC socket");
+                    return Some(Box::new(t));
+                }
+                Err(e) => log::warn!("Hyprland IPC unavailable ({e}); falling back to AT-SPI"),
+            }
+        }
         if wayland::is_kde() {
             match kwin::KwinTracker::start(events.clone()) {
                 Ok(t) => {

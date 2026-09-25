@@ -28,8 +28,8 @@ Recovered directly from the shipped Electron bundle — not guessed.
 | `IsReady` → `ACK` | ✅ handshake + keepalive | ✅ |
 | `PasteText` | ✅ clipboard (`xclip`/`xsel`) + XTEST Ctrl+V | ✅ **live-validated** — in-process text/plain+text/html clipboard + uinput Ctrl+V |
 | `SimulateKeyPress` | ✅ VK→keysym→keycode + XTEST | ✅ VK→evdev + uinput chord (all modifiers released after) |
-| `GetActiveAppInfo` / `GetAppInfo` | ✅ `_NET_ACTIVE_WINDOW`→PID/`WM_CLASS` | ✅ **KDE** via KWin script bridge; ⬜ other compositors |
-| `GetRunningApps` | ✅ `_NET_CLIENT_LIST` | ⚠️ KDE: active app only (full list TBD); ⬜ other |
+| `GetActiveAppInfo` / `GetAppInfo` | ✅ `_NET_ACTIVE_WINDOW`→PID/`WM_CLASS` | ✅ **KDE** via KWin script bridge; ✅ **Hyprland** via its IPC socket; ⬜ other compositors |
+| `GetRunningApps` | ✅ `_NET_CLIENT_LIST` | ⚠️ KDE: active app only (full list TBD); ✅ Hyprland; ⬜ other |
 | `SetFocusChangeDetectorState` → `AppInfoUpdate` | ⬜ (TODO: `PropertyNotify`) | ✅ **KDE** — focus events on fd 3, gated & deduped |
 | `GetSelectedTextViaCopy` | ⚠️ Ctrl+C copy-probe | ⚠️ Ctrl+C copy-probe |
 | `GetAccessibilityStatus` | ✅ (connection live) | ✅ (uinput live) |
@@ -124,6 +124,7 @@ src/
     uinput.rs        in-process /dev/uinput virtual keyboard
     wl_clipboard.rs  in-process text/plain+text/html clipboard (ext_data_control)
     kwin.rs          KDE active-window bridge + focus-event source (zbus + KWin script)
+    hyprland.rs      Hyprland active-window identity + running apps (IPC socket, desktop-entry names)
     stub.rs          no-op fallback (keeps handshake alive on unsupported sessions)
 test_harness.py      Electron stand-in: scripted handshake/info conversation
 live_inject_test.py  live PasteText + Ctrl+A/Ctrl+C round-trip against a focused editor
